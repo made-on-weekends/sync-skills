@@ -1,0 +1,6 @@
+# Claude Code
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Gemini
+.gemini/.env

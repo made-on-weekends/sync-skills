@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Sync Skills — symlink each skill from ~/.agents/skills into per-tool dirs
+#
+# Source layout:   ~/.agents/skills/<skill>/SKILL.md
+# After running:   ~/.claude/skills/<skill>            -> ~/.agents/skills/<skill>
+#                  ~/.codex/skills/<skill>             -> ~/.agents/skills/<skill>
+#                  ...etc (one symlink per skill, not the whole dir)
+#
+# AGENT SWITCH: set enabled=1 to sync, enabled=0 to disable.
+# Disabling a target wipes its directory entirely (rm -rf).
+#
+# Re-runnable. Existing correct symlinks are left alone. Real files/dirs
+# at a target path are never overwritten — use --force only to replace
+# stale symlinks that point elsewhere.
+
+set -euo pipefail
+
+SOURCE="${SKILLS_SOURCE:-${HOME}/.agents/skills}"
+
+# ---------------------------------------------------------------------------
+# Agent switch settings — set enabled=0 to disable and wipe the target dir.
+# Format: "<path>:<enabled>"   1=sync  0=disable+wipe
+# ---------------------------------------------------------------------------
+declare -A TARGET_STATE
+TARGET_STATE["${HOME}/.claude/skills"]=1              # Claude Code
+TARGET_STATE["${HOME}/.codex/skills"]=1               # Codex CLI
+TARGET_STATE["${HOME}/.cursor/skills"]=1              # Cursor
+TARGET_STATE["${HOME}/.cline/skills"]=1               # Cline
+TARGET_STATE["${HOME}/.copilot/skills"]=1             # GitHub Copilot
+TARGET_STATE["${HOME}/.gemini/skills"]=1              # Gemini CLI
+TARGET_STATE["${HOME}/.gemini/antigravity/skills"]=1  # Antigravity (global)
+TARGET_STATE["${HOME}/.config/opencode/skills"]=1     # opencode
+TARGET_STATE["${HOME}/.hermes/skills"]=1              # Hermes
+TARGET_STATE["${HOME}/.windsurf/skills"]=0            # Windsurf       — disabled
+TARGET_STATE["${HOME}/.continue/skills"]=0            # Continue       — disabled
+TARGET_STATE["${HOME}/.roo/skills"]=0                 # Roo            — disabled
+TARGET_STATE["${HOME}/.trae/skills"]=0                # Trae           — disabled
+TARGET_STATE["${HOME}/.kiro/skills"]=0                # Kiro           — disabled
+TARGET_STATE["${HOME}/.qoder/skills"]=0               # Qoder          — disabled
+TARGET_STATE["${HOME}/.codebuddy/skills"]=0           # CodeBuddy      — disabled
+
+# Ordered list for deterministic output
+TARGETS=(
+  "${HOME}/.claude/skills"
+  "${HOME}/.codex/skills"
+  "${HOME}/.cursor/skills"
+  "${HOME}/.cline/skills"
+  "${HOME}/.copilot/skills"
+  "${HOME}/.gemini/skills"
+  "${HOME}/.gemini/antigravity/skills"
+  "${HOME}/.config/opencode/skills"
+  "${HOME}/.hermes/skills"
+  "${HOME}/.windsurf/skills"
+  "${HOME}/.continue/skills"
+  "${HOME}/.roo/skills"
+  "${HOME}/.trae/skills"
+  "${HOME}/.kiro/skills"
+  "${HOME}/.qoder/skills"
+  "${HOME}/.codebuddy/skills"
+)
+
+DRY_RUN=0
+FORCE=0
+PRUNE=0
+VERBOSE=0
+REPORT=0
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Scans \$SKILLS_SOURCE (default: ~/.agents/skills) for skill directories
+and symlinks each one into every enabled tool skill directory.
+
+Disabled targets (TARGET_STATE=0) have their directories wiped on next run.
+Edit the TARGET_STATE block at the top of this script to enable/disable tools.
+
+Options:
+  -n, --dry-run   Show what would happen, change nothing
+  -f, --force     Replace existing symlinks pointing elsewhere
+                  (real files/dirs are still never touched)
+  -p, --prune     Remove broken symlinks in target dirs
+                  (links whose source no longer exists)
+  -r, --report    Audit each target dir and print counts:
+                  correct symlinks / stale symlinks / broken symlinks / real dirs
+                  No changes are made.
+  -v, --verbose   Print every action, including no-ops
+  -h, --help      Show this help
+
+Environment:
+  SKILLS_SOURCE   Override the source directory
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    -f|--force)   FORCE=1; shift ;;
+    -p|--prune)   PRUNE=1; shift ;;
+    -r|--report)  REPORT=1; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+run() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[dry-run] $*"
+  else
+    [[ $VERBOSE -eq 1 ]] && echo "    $*"
+    "$@"
+  fi
+}
+
+# --- find skills ----------------------------------------------------------
+
+if [[ ! -d "$SOURCE" ]]; then
+  echo "Error: source dir not found: $SOURCE" >&2
+  exit 1
+fi
+
+SKILLS=()
+while IFS= read -r -d '' dir; do
+  [[ -f "$dir/SKILL.md" ]] && SKILLS+=("$dir")
+done < <(find "$SOURCE" -mindepth 1 -maxdepth 1 -type d -print0)
+
+if [[ ${#SKILLS[@]} -eq 0 ]]; then
+  echo "No skills found in $SOURCE (looking for subdirs containing SKILL.md)"
+  exit 0
+fi
+
+echo "Found ${#SKILLS[@]} skill(s) in $SOURCE"
+
+# --- report mode ----------------------------------------------------------
+
+if [[ $REPORT -eq 1 ]]; then
+  echo
+  printf "%-44s  %-8s  %7s  %6s  %7s  %9s\n" "TARGET" "STATE" "CORRECT" "STALE" "BROKEN" "REAL-DIRS"
+  printf "%-44s  %-8s  %7s  %6s  %7s  %9s\n" "------" "-----" "-------" "-----" "------" "---------"
+
+  for target in "${TARGETS[@]}"; do
+    enabled="${TARGET_STATE[$target]:-1}"
+    state_label=$([[ $enabled -eq 1 ]] && echo "enabled" || echo "DISABLED")
+
+    correct=0
+    stale=0
+    broken=0
+    real_dirs=0
+
+    if [[ ! -d "$target" ]]; then
+      printf "%-44s  %-8s  %7s  %6s  %7s  %9s\n" "$target" "$state_label" "-" "-" "-" "(missing)"
+      continue
+    fi
+
+    while IFS= read -r -d '' entry; do
+      name="$(basename "$entry")"
+      expected="$SOURCE/$name"
+      if [[ -L "$entry" ]]; then
+        current="$(readlink "$entry")"
+        if [[ ! -e "$entry" ]]; then
+          broken=$((broken + 1))
+        elif [[ "$current" == "$expected" ]]; then
+          correct=$((correct + 1))
+        else
+          stale=$((stale + 1))
+        fi
+      elif [[ -d "$entry" ]]; then
+        real_dirs=$((real_dirs + 1))
+      fi
+    done < <(find "$target" -mindepth 1 -maxdepth 1 -print0)
+
+    printf "%-44s  %-8s  %7d  %6d  %7d  %9d\n" "$target" "$state_label" "$correct" "$stale" "$broken" "$real_dirs"
+  done
+
+  echo
+  echo "Report complete. No changes made."
+  exit 0
+fi
+
+# --- wipe disabled targets ------------------------------------------------
+
+wiped=0
+
+for target in "${TARGETS[@]}"; do
+  enabled="${TARGET_STATE[$target]:-1}"
+  [[ $enabled -eq 1 ]] && continue
+  # wipe the tool root dir (parent of /skills), not just the skills subdir
+  tool_root="$(dirname "$target")"
+  if [[ -d "$tool_root" || -L "$tool_root" ]]; then
+    echo "✕ $tool_root (disabled — wiping)"
+    run rm -rf "$tool_root"
+    wiped=$((wiped + 1))
+  else
+    [[ $VERBOSE -eq 1 ]] && echo "✕ $tool_root (disabled — already absent)"
+  fi
+done
+
+# --- link into each enabled target ----------------------------------------
+
+linked=0
+skipped=0
+errored=0
+pruned=0
+
+for target in "${TARGETS[@]}"; do
+  enabled="${TARGET_STATE[$target]:-1}"
+  [[ $enabled -eq 0 ]] && continue
+
+  echo
+  echo "→ $target"
+  run mkdir -p "$target"
+
+  for skill_path in "${SKILLS[@]}"; do
+    skill_name="$(basename "$skill_path")"
+    link_path="$target/$skill_name"
+
+    if [[ -L "$link_path" ]]; then
+      current="$(readlink "$link_path")"
+      if [[ "$current" == "$skill_path" ]]; then
+        [[ $VERBOSE -eq 1 ]] && echo "  = $skill_name (already linked)"
+        skipped=$((skipped + 1))
+        continue
+      fi
+      if [[ $FORCE -eq 1 ]]; then
+        echo "  ↻ replacing $skill_name (was → $current)"
+        run rm "$link_path"
+      else
+        echo "  ⚠ $skill_name: existing symlink → $current (use --force to replace)"
+        skipped=$((skipped + 1))
+        continue
+      fi
+    elif [[ -e "$link_path" ]]; then
+      # real file or dir already there — not ours to manage, leave alone
+      [[ $VERBOSE -eq 1 ]] && echo "  = $skill_name (real file/dir, ignored)"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if run ln -s "$skill_path" "$link_path"; then
+      echo "  + $skill_name"
+      linked=$((linked + 1))
+    else
+      errored=$((errored + 1))
+    fi
+  done
+
+  # prune broken symlinks in this target
+  if [[ $PRUNE -eq 1 && -d "$target" ]]; then
+    while IFS= read -r -d '' link; do
+      if [[ -L "$link" && ! -e "$link" ]]; then
+        echo "  − $(basename "$link") (broken, removing)"
+        run rm "$link"
+        pruned=$((pruned + 1))
+      fi
+    done < <(find "$target" -mindepth 1 -maxdepth 1 -type l -print0)
+  fi
+done
+
+echo
+echo "Done. linked=$linked skipped=$skipped errored=$errored pruned=$pruned wiped=$wiped"
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "(dry-run: nothing actually changed)"
+fi
